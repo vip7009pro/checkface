@@ -4,12 +4,14 @@ import androidx.compose.runtime.Composable
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
 
 object AppDestinations {
     const val REGISTRATION_ROUTE = "registration"
     const val RECOGNITION_ROUTE = "recognition"
 }
 
+@OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun AppNavigation() {
     val navController = rememberNavController()
