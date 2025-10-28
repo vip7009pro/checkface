@@ -5,71 +5,106 @@ import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.util.Log
+import android.util.Size
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
-import androidx.camera.view.CameraController
-import androidx.camera.view.LifecycleCameraController
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.toAndroidRectF
 import androidx.compose.ui.graphics.toComposeRect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
 import androidx.navigation.NavController
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.PermissionState
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
-import java.util.concurrent.Executor
-import android.graphics.YuvImage
-import androidx.compose.ui.graphics.toAndroidRectF
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import kotlin.math.max
+import android.graphics.YuvImage
 
-@OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
+
+
+@kotlin.OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
 @Composable
-fun RegistrationScreen(navController: NavController) {
+fun RegistrationScreen(
+    navController: NavController,
+    lifecycleOwner: LifecycleOwner = LocalLifecycleOwner.current,
+    cameraPermissionState: PermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
+) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
-
     val faceRepository = remember { FaceRepository(context) }
     val faceNetModel = remember { FaceNetModel(context) }
     var employeeName by remember { mutableStateOf("") }
     var isRegistering by remember { mutableStateOf(false) }
 
-    val cameraController = remember {
-        LifecycleCameraController(context).apply {
-            setEnabledUseCases(CameraController.IMAGE_CAPTURE)
-            cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+    // State cho việc phát hiện khuôn mặt
+    var faceBoundingBox by remember { mutableStateOf<RectF?>(null) }
+    var isFaceInBounds by remember { mutableStateOf(false) }
+    var imageSize by remember { mutableStateOf(Size(0, 0)) }
+
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    val imageCapture = remember { ImageCapture.Builder().build() }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            cameraExecutor.shutdown()
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Đăng ký Nhân viên") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
-                }
-            )
-        }
-    ) { paddingValues ->
+
+    Scaffold(topBar = {
+        TopAppBar(title = { Text("Đăng ký Nhân viên") }, navigationIcon = {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+        })
+    }) { paddingValues ->
         if (cameraPermissionState.status.isGranted) {
             Column(
                 modifier = Modifier
@@ -84,15 +119,56 @@ fun RegistrationScreen(navController: NavController) {
                         .padding(16.dp),
                     contentAlignment = Alignment.Center
                 ) {
+                    val previewView = remember { PreviewView(context) }
                     AndroidView(
-                        factory = { ctx ->
-                            PreviewView(ctx).apply {
-                                controller = cameraController
-                                cameraController.bindToLifecycle(lifecycleOwner)
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize()
-                    )
+                        factory = { previewView },
+                        modifier = Modifier.fillMaxSize(),
+                        update = {
+                            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+                            cameraProviderFuture.addListener({
+                                val cameraProvider = cameraProviderFuture.get()
+
+                                val preview = Preview.Builder().build().also {
+                                    it.setSurfaceProvider(previewView.surfaceProvider)
+                                }
+
+                                val imageAnalysis =
+                                    ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                        .build().apply {
+                                            setAnalyzer(cameraExecutor) { imageProxy ->
+                                                processImageForFaceDetection(imageProxy) { rect ->
+                                                    ContextCompat.getMainExecutor(context)
+                                                        .execute {
+                                                            faceBoundingBox = rect
+                                                            imageSize = Size(
+                                                                imageProxy.height, imageProxy.width
+                                                            ) // Kích thước đã xoay
+                                                        }
+                                                }
+                                            }
+                                        }
+
+                                val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+
+                                try {
+                                    cameraProvider.unbindAll()
+                                    cameraProvider.bindToLifecycle(
+                                        lifecycleOwner,
+                                        cameraSelector,
+                                        preview,
+                                        imageAnalysis,
+                                        imageCapture
+                                    )
+                                } catch (e: Exception) {
+                                    Log.e("RegistrationScreen", "Use case binding failed", e)
+                                }
+                            }, ContextCompat.getMainExecutor(context))
+                        })
+
+                    // Vẽ khung hướng dẫn và hộp bao khuôn mặt
+                    FaceRegistrationOverlay(box = faceBoundingBox,
+                        imageSize = imageSize,
+                        onFaceInBoundsChange = { isFaceInBounds = it })
                 }
 
                 OutlinedTextField(
@@ -109,20 +185,24 @@ fun RegistrationScreen(navController: NavController) {
                     onClick = {
                         if (employeeName.isNotBlank() && !isRegistering) {
                             isRegistering = true
-                            captureAndProcessFace(context, cameraController, employeeName, faceRepository, faceNetModel) { success ->
+                            captureAndProcessFace(
+                                context,
+                                imageCapture,
+                                employeeName,
+                                faceRepository,
+                                faceNetModel
+                            ) { success ->
                                 isRegistering = false
                                 if (success) {
                                     navController.popBackStack()
                                 }
                             }
-                        } else {
-                            Toast.makeText(context, "Vui lòng nhập tên nhân viên", Toast.LENGTH_SHORT).show()
                         }
                     },
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(16.dp),
-                    enabled = !isRegistering
+                    enabled = !isRegistering && employeeName.isNotBlank() && isFaceInBounds
                 ) {
                     Text(if (isRegistering) "Đang xử lý..." else "Chụp và Đăng ký")
                 }
@@ -147,9 +227,118 @@ fun RegistrationScreen(navController: NavController) {
     }
 }
 
+
+@Composable
+private fun FaceRegistrationOverlay(
+    box: RectF?,
+    imageSize: Size,
+    onFaceInBoundsChange: (Boolean) -> Unit
+) {
+    var isFaceIn by remember { mutableStateOf(false) }
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val screenWidth = size.width
+        val screenHeight = size.height
+
+        // Vẽ khung hướng dẫn (màu trắng)
+        val guideBoxWidth = screenWidth * 0.8f
+        val guideBoxHeight = screenHeight * 0.6f
+        val guideBoxLeft = (screenWidth - guideBoxWidth) / 2
+        val guideBoxTop = (screenHeight - guideBoxHeight) / 2
+        val guideRect = Rect(
+            left = guideBoxLeft,
+            top = guideBoxTop,
+            right = guideBoxLeft + guideBoxWidth,
+            bottom = guideBoxTop + guideBoxHeight
+        )
+        drawRect(
+            color = Color.White, topLeft = guideRect.topLeft, size = guideRect.size, style = Stroke(
+                width = 2.dp.toPx()
+            )
+        )
+
+        var isFaceInCurrentDraw = false
+        // Vẽ hộp bao quanh khuôn mặt (nếu có)
+        box?.let {
+            if (imageSize.width > 0 && imageSize.height > 0) {
+                // Lật ngược tọa độ cho camera trước
+                val mirroredBox = RectF(
+                    imageSize.width - it.right, it.top, imageSize.width - it.left, it.bottom
+                )
+
+                // Chuyển đổi tọa độ từ ảnh sang màn hình
+                val scaleX = screenWidth / imageSize.width
+                val scaleY = screenHeight / imageSize.height
+                val scale = max(scaleX, scaleY)
+                val offsetX = (screenWidth - imageSize.width * scale) / 2
+                val offsetY = (screenHeight - imageSize.height * scale) / 2
+
+                val drawRect = Rect(
+                    left = mirroredBox.left * scale + offsetX,
+                    top = mirroredBox.top * scale + offsetY,
+                    right = mirroredBox.right * scale + offsetX,
+                    bottom = mirroredBox.bottom * scale + offsetY
+                )
+
+                // Kiểm tra xem khuôn mặt có nằm trong khung hướng dẫn không
+                isFaceInCurrentDraw = guideRect.contains(drawRect.topLeft) && guideRect.contains(
+                    drawRect.bottomRight
+                )
+
+                drawRect(
+                    color = if (isFaceInCurrentDraw) Color.Green else Color.Red,
+                    topLeft = drawRect.topLeft,
+                    size = drawRect.size,
+                    style = Stroke(width = 2.dp.toPx())
+                )
+            }
+        }
+        isFaceIn = isFaceInCurrentDraw
+    }
+
+    // Cập nhật trạng thái ra bên ngoài Composable một cách an toàn
+    LaunchedEffect(isFaceIn) {
+        onFaceInBoundsChange(isFaceIn)
+    }
+}
+
+
+@OptIn(ExperimentalGetImage::class)
+private fun processImageForFaceDetection(
+    imageProxy: ImageProxy, onFaceDetected: (RectF?) -> Unit
+) {
+    val mediaImage = imageProxy.image ?: run {
+        imageProxy.close()
+        onFaceDetected(null)
+        return
+    }
+    val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+    val detector = FaceDetection.getClient(
+        FaceDetectorOptions.Builder().setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .build()
+    )
+
+    detector.process(image).addOnSuccessListener { faces ->
+            if (faces.isNotEmpty()) {
+                // Lấy khuôn mặt lớn nhất
+                val largestFace =
+                    faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                onFaceDetected(largestFace?.boundingBox?.toComposeRect()?.toAndroidRectF())
+            } else {
+                onFaceDetected(null)
+            }
+        }.addOnFailureListener { e ->
+            Log.e("RegistrationScreen", "Face detection failed", e)
+            onFaceDetected(null)
+        }.addOnCompleteListener {
+            imageProxy.close()
+        }
+}
+
+
 private fun captureAndProcessFace(
     context: Context,
-    cameraController: LifecycleCameraController,
+    imageCapture: ImageCapture,
     employeeName: String,
     faceRepository: FaceRepository,
     faceNetModel: FaceNetModel,
@@ -157,25 +346,27 @@ private fun captureAndProcessFace(
 ) {
     val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
 
-    cameraController.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
-        @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+    imageCapture.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+        @OptIn(ExperimentalGetImage::class)
         override fun onCaptureSuccess(imageProxy: ImageProxy) {
             val bitmap = imageProxy.image?.toBitmap() ?: run {
-                Log.e("RegistrationScreen", "No image in ImageProxy")
                 onResult(false)
                 imageProxy.close()
                 return
             }
             val rotatedBitmap = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
 
-            processBitmapForRegistration(context, rotatedBitmap, employeeName, faceRepository, faceNetModel, onResult)
+            processBitmapForRegistration(
+                context, rotatedBitmap, employeeName, faceRepository, faceNetModel, onResult
+            )
 
             imageProxy.close()
         }
 
         override fun onError(exception: ImageCaptureException) {
             Log.e("RegistrationScreen", "Image capture failed: ${exception.message}", exception)
-            Toast.makeText(context, "Chụp ảnh thất bại: ${exception.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, "Chụp ảnh thất bại: ${exception.message}", Toast.LENGTH_LONG)
+                .show()
             onResult(false)
         }
     })
@@ -192,50 +383,43 @@ private fun processBitmapForRegistration(
     val image = InputImage.fromBitmap(bitmap, 0)
     val detectorOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
-        .setMinFaceSize(0.15f)
-        .build()
+        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL).setMinFaceSize(0.15f).build()
     val detector = FaceDetection.getClient(detectorOptions)
 
-    detector.process(image)
-        .addOnSuccessListener { faces ->
+    detector.process(image).addOnSuccessListener { faces ->
             if (faces.isNotEmpty()) {
-                val firstFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }!!
-                Log.d("RegistrationScreen", "Face detected: boundingBox=${firstFace.boundingBox}")
+                val firstFace =
+                    faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }!!
 
-                val faceBitmap = faceNetModel.cropFace(bitmap, firstFace.boundingBox.toComposeRect().toAndroidRectF())
+                val faceBitmap = faceNetModel.cropFace(
+                    bitmap, firstFace.boundingBox.toComposeRect().toAndroidRectF()
+                )
 
                 if (faceBitmap != null) {
                     val realEmbedding = faceNetModel.getFaceEmbedding(faceBitmap)
-                    Log.d("RegistrationScreen", "Embedding size for $employeeName: ${realEmbedding.size}")
 
                     val newFace = FaceData(employeeName, realEmbedding)
                     faceRepository.addFace(newFace)
 
-                    Log.i("RegistrationScreen", "Khuôn mặt đã được đăng ký cho: $employeeName")
-                    Toast.makeText(context, "Đăng ký thành công cho $employeeName!", Toast.LENGTH_SHORT).show()
-                    val embeddingSnippet = realEmbedding.take(5).joinToString(
-                        separator = ", ",
-                        prefix = "[",
-                        postfix = ", ...]"
-                    ) { String.format("%.4f", it) }
-                    Toast.makeText(context, "Embedding: $embeddingSnippet", Toast.LENGTH_LONG).show()
-
+                    Toast.makeText(
+                        context, "Đăng ký thành công cho $employeeName!", Toast.LENGTH_SHORT
+                    ).show()
                     onResult(true)
                 } else {
-                    Log.e("RegistrationScreen", "Failed to crop face")
-                    Toast.makeText(context, "Không thể cắt khuôn mặt. Vui lòng thử lại.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(
+                        context, "Không thể cắt khuôn mặt. Vui lòng thử lại.", Toast.LENGTH_LONG
+                    ).show()
                     onResult(false)
                 }
             } else {
-                Log.w("RegistrationScreen", "Không tìm thấy khuôn mặt nào trong ảnh.")
-                Toast.makeText(context, "Không tìm thấy khuôn mặt. Vui lòng thử lại.", Toast.LENGTH_LONG).show()
+                Toast.makeText(
+                    context, "Không tìm thấy khuôn mặt. Vui lòng thử lại.", Toast.LENGTH_LONG
+                ).show()
                 onResult(false)
             }
-        }
-        .addOnFailureListener { e ->
-            Log.e("RegistrationScreen", "Xử lý khuôn mặt thất bại", e)
-            Toast.makeText(context, "Xử lý khuôn mặt thất bại: ${e.message}", Toast.LENGTH_LONG).show()
+        }.addOnFailureListener { e ->
+            Toast.makeText(context, "Xử lý khuôn mặt thất bại: ${e.message}", Toast.LENGTH_LONG)
+                .show()
             onResult(false)
         }
 }
@@ -263,9 +447,12 @@ fun android.media.Image.toBitmap(): Bitmap {
         vBuffer.get(nv21, ySize, vSize)
         uBuffer.get(nv21, ySize + vSize, uSize)
 
-        val yuvImage = YuvImage(nv21, android.graphics.ImageFormat.NV21, this.width, this.height, null)
+        val yuvImage =
+            YuvImage(nv21, android.graphics.ImageFormat.NV21, this.width, this.height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, yuvImage.width, yuvImage.height), 100, out)
+        yuvImage.compressToJpeg(
+            android.graphics.Rect(0, 0, yuvImage.width, yuvImage.height), 100, out
+        )
         val imageBytes = out.toByteArray()
         return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }

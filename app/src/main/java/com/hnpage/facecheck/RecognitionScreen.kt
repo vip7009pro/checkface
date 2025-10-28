@@ -1,7 +1,9 @@
 package com.hnpage.facecheck
 
+import android.app.Activity
 import android.graphics.RectF
 import android.util.Log
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
@@ -11,13 +13,16 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.toAndroidRectF
 import androidx.compose.ui.graphics.toComposeRect
 import androidx.compose.ui.platform.LocalContext
@@ -26,6 +31,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavController
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -34,13 +40,17 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
+import kotlin.math.max
 
 // Hằng số cho việc phân tích hình ảnh
-private const val ANALYSIS_INTERVAL_MS = 1000L // Phân tích 1 frame mỗi giây
-private const val RECOGNITION_COOLDOWN_MS = 3000L // Chờ 3 giây sau khi nhận diện thành công
-private const val FACE_RECOGNITION_THRESHOLD = 0.7f // Giảm ngưỡng để dễ nhận diện hơn
+private const val ANALYSIS_INTERVAL_MS = 200L // Phân tích 1 frame mỗi giây
+private const val RECOGNITION_COOLDOWN_MS = 1000L // Chờ 3 giây sau khi nhận diện thành công
+private const val FACE_RECOGNITION_THRESHOLD = 0.7f // Ngưỡng nhận diện
+private const val SCREEN_DIM_DELAY_MS = 5000L // Thời gian chờ trước khi làm tối màn hình
 
 // Enum để quản lý trạng thái phân tích
 enum class AnalysisStatus {
@@ -60,9 +70,16 @@ fun RecognitionScreen(navController: NavController) {
 
     var registeredFaces by remember { mutableStateOf<List<FaceData>>(emptyList()) }
     var recognizedEmployee by remember { mutableStateOf<String?>(null) }
+    var similarityScore by remember { mutableStateOf<Float?>(null) }
+    var faceBoundingBox by remember { mutableStateOf<RectF?>(null) }
+    var imageSize by remember { mutableStateOf(Size(0f, 0f)) }
+
+
     var lastAnalysisTime by remember { mutableStateOf(0L) }
     var lastRecognitionTime by remember { mutableStateOf(0L) }
     var analysisStatus by remember { mutableStateOf(AnalysisStatus.IDLE) }
+    var isFaceDetected by remember { mutableStateOf(false) }
+
 
     // Tải danh sách khuôn mặt đã đăng ký
     LaunchedEffect(key1 = lifecycleOwner) {
@@ -80,18 +97,47 @@ fun RecognitionScreen(navController: NavController) {
     val previewView = remember { PreviewView(context) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
+    // Quản lý màn hình
+    val activity = context as? Activity
     DisposableEffect(Unit) {
+        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
             cameraExecutor.shutdown()
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            // Reset độ sáng khi thoát
+            activity?.window?.attributes = activity.window.attributes.apply {
+                screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
         }
     }
+
+    // Coroutine để quản lý độ sáng màn hình
+    LaunchedEffect(isFaceDetected) {
+        val dimJob: Job = launch {
+            if (!isFaceDetected) {
+                delay(SCREEN_DIM_DELAY_MS)
+                activity?.window?.attributes = activity.window.attributes.apply {
+                    screenBrightness = 0.1f // Làm tối màn hình
+                }
+                Log.d("RecognitionScreen", "Screen dimmed")
+            }
+        }
+
+        if (isFaceDetected) {
+            dimJob.cancel() // Hủy việc làm tối nếu phát hiện khuôn mặt
+            activity?.window?.attributes = activity.window.attributes.apply {
+                screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE // Khôi phục độ sáng
+            }
+            Log.d("RecognitionScreen", "Screen brightness restored")
+        }
+    }
+
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Điểm danh Nhân viên") },
                 actions = {
-                    // Nút để xóa dữ liệu và đăng ký lại
                     TextButton(onClick = {
                         faceRepository.clearFaces()
                         registeredFaces = emptyList()
@@ -115,7 +161,6 @@ fun RecognitionScreen(navController: NavController) {
                     update = {
                         cameraProviderFuture.addListener({
                             val cameraProvider = cameraProviderFuture.get()
-
                             val preview = Preview.Builder().build().also {
                                 it.setSurfaceProvider(previewView.surfaceProvider)
                             }
@@ -129,16 +174,28 @@ fun RecognitionScreen(navController: NavController) {
                                             lastAnalysisTime = currentTime
                                             processImageForRecognition(
                                                 imageProxy, faceNetModel, registeredFaces
-                                            ) { name, _ ->
+                                            ) { name, rect, score ->
                                                 ContextCompat.getMainExecutor(context).execute {
+                                                    isFaceDetected = rect != null
+                                                    faceBoundingBox = rect
+                                                    imageSize = Size(
+                                                        imageProxy.height.toFloat(),
+                                                        imageProxy.width.toFloat()
+                                                    ) // Lưu kích thước ảnh đã xoay
+
                                                     if (name != null) {
                                                         recognizedEmployee = name
+                                                        similarityScore = score
                                                         lastRecognitionTime = System.currentTimeMillis()
                                                         analysisStatus = AnalysisStatus.SUCCESS
-                                                        Log.d("RecognitionScreen", "Recognized: $name")
-                                                    } else {
+                                                        Log.d("RecognitionScreen", "Recognized: $name with score $score")
+                                                    } else if (rect != null) {
+                                                        // Khuôn mặt được phát hiện nhưng không nhận dạng được
                                                         analysisStatus = AnalysisStatus.FAILURE
-                                                        Log.d("RecognitionScreen", "No face recognized")
+                                                        Log.d("RecognitionScreen", "Face detected but not recognized")
+                                                    } else {
+                                                        // Không có khuôn mặt nào
+                                                        analysisStatus = AnalysisStatus.IDLE
                                                     }
                                                 }
                                             }
@@ -155,16 +212,22 @@ fun RecognitionScreen(navController: NavController) {
                                 cameraProvider.bindToLifecycle(
                                     lifecycleOwner, cameraSelector, preview, imageAnalysis
                                 )
-                                Log.d("RecognitionScreen", "Camera bound successfully")
                             } catch (e: Exception) {
                                 Log.e("RecognitionScreen", "Use case binding failed", e)
-                                ContextCompat.getMainExecutor(context).execute {
-                                    Toast.makeText(context, "Lỗi khởi tạo camera", Toast.LENGTH_SHORT).show()
-                                }
                             }
                         }, ContextCompat.getMainExecutor(context))
                     }
                 )
+
+                // Vẽ hộp bao quanh khuôn mặt
+                faceBoundingBox?.let { box ->
+                    DrawBoundingBox(
+                        box = box,
+                        imageSize = imageSize,
+                        isSuccess = analysisStatus == AnalysisStatus.SUCCESS
+                    )
+                }
+
 
                 // Chỉ thị màu trạng thái phân tích
                 Box(
@@ -188,12 +251,18 @@ fun RecognitionScreen(navController: NavController) {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.SpaceBetween
                 ) {
+                    val textToShow = when {
+                        recognizedEmployee != null -> {
+                            val scoreText = similarityScore?.let { " (Score: %.2f)".format(it) } ?: ""
+                            "Chào mừng, $recognizedEmployee!$scoreText"
+                        }
+                        registeredFaces.isEmpty() -> "Vui lòng đăng ký nhân viên mới."
+                        isFaceDetected -> "Đang nhận diện..."
+                        else -> "Vui lòng nhìn vào camera..."
+                    }
+
                     Text(
-                        text = when {
-                            recognizedEmployee != null -> "Chào mừng, $recognizedEmployee!"
-                            registeredFaces.isEmpty() -> "Vui lòng đăng ký nhân viên mới."
-                            else -> "Vui lòng nhìn vào camera..."
-                        },
+                        text = textToShow,
                         style = MaterialTheme.typography.headlineSmall,
                         color = Color.White,
                         textAlign = TextAlign.Center,
@@ -213,22 +282,20 @@ fun RecognitionScreen(navController: NavController) {
                 if (recognizedEmployee != null) {
                     delay(RECOGNITION_COOLDOWN_MS)
                     recognizedEmployee = null
+                    similarityScore = null
+                    faceBoundingBox = null
+                    isFaceDetected = false
                     analysisStatus = AnalysisStatus.IDLE
                 }
             }
         } else {
             Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(paddingValues),
+                modifier = Modifier.fillMaxSize().padding(paddingValues),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text("Cần quyền truy cập camera để điểm danh.")
-                Button(
-                    onClick = { cameraPermissionState.launchPermissionRequest() },
-                    modifier = Modifier.padding(top = 16.dp)
-                ) {
+                Button(onClick = { cameraPermissionState.launchPermissionRequest() }, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Yêu cầu quyền")
                 }
             }
@@ -236,87 +303,111 @@ fun RecognitionScreen(navController: NavController) {
     }
 }
 
+@Composable
+fun DrawBoundingBox(box: RectF, imageSize: Size, isSuccess: Boolean) {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        if (imageSize.width > 0 && imageSize.height > 0) {
+            // Camera trước thường bị lật ngược theo chiều ngang
+            val mirroredBox = RectF(
+                imageSize.width - box.right,
+                box.top,
+                imageSize.width - box.left,
+                box.bottom
+            )
+
+            // Tính toán tỉ lệ và offset để vẽ trên màn hình
+            val scaleX = size.width / imageSize.width
+            val scaleY = size.height / imageSize.height
+            // Sử dụng scale lớn hơn để lấp đầy và cắt (giống PreviewView.ScaleType.FILL_CENTER)
+            val scale = max(scaleX, scaleY)
+
+            val offsetX = (size.width - imageSize.width * scale) / 2
+            val offsetY = (size.height - imageSize.height * scale) / 2
+
+            val drawRect = androidx.compose.ui.geometry.Rect(
+                left = mirroredBox.left * scale + offsetX,
+                top = mirroredBox.top * scale + offsetY,
+                right = mirroredBox.right * scale + offsetX,
+                bottom = mirroredBox.bottom * scale + offsetY
+            )
+
+            drawRect(
+                color = if (isSuccess) Color.Green else Color.Red,
+                topLeft = drawRect.topLeft,
+                size = drawRect.size,
+                style = Stroke(width = 4.dp.toPx())
+            )
+        }
+    }
+}
+
+
 @OptIn(ExperimentalGetImage::class)
 private fun processImageForRecognition(
     imageProxy: ImageProxy,
     faceNetModel: FaceNetModel,
     registeredFaces: List<FaceData>,
-    onResult: (String?, RectF?) -> Unit
+    onResult: (String?, RectF?, Float?) -> Unit
 ) {
     val mediaImage = imageProxy.image ?: run {
-        Log.e("RecognitionScreen", "No image in ImageProxy")
         imageProxy.close()
-        onResult(null, null)
+        onResult(null, null, null)
         return
     }
+    // Kích thước ảnh gốc trước khi xoay (cho việc chuyển đổi tọa độ)
     val rotatedBitmap = rotateBitmap(mediaImage.toBitmap(), imageProxy.imageInfo.rotationDegrees)
 
     val image = InputImage.fromBitmap(rotatedBitmap, 0)
     val detector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
-            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
-            .setMinFaceSize(0.15f)
             .build()
     )
 
     detector.process(image)
         .addOnSuccessListener { faces ->
-            Log.d("RecognitionScreen", "Detected ${faces.size} faces")
             if (faces.isNotEmpty()) {
                 val firstFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }!!
-                Log.d("RecognitionScreen", "Face detected: boundingBox=${firstFace.boundingBox}, landmarks=${firstFace.allLandmarks}")
+                val faceRect = firstFace.boundingBox.toComposeRect().toAndroidRectF()
 
-                val faceBitmap = faceNetModel.cropFace(
-                    rotatedBitmap, firstFace.boundingBox.toComposeRect().toAndroidRectF()
-                )
+                val faceBitmap = faceNetModel.cropFace(rotatedBitmap, faceRect)
 
                 if (faceBitmap != null) {
-                    Log.d("RecognitionScreen", "FaceBitmap: width=${faceBitmap.width}, height=${faceBitmap.height}")
-
                     try {
                         val currentEmbedding = faceNetModel.getFaceEmbedding(faceBitmap)
-                        Log.d("RecognitionScreen", "Current embedding size: ${currentEmbedding.size}")
-
                         var bestMatch: Pair<String, Float>? = null
+
                         for (registeredFace in registeredFaces) {
-                            Log.d("RecognitionScreen", "Registered face: ${registeredFace.employeeName}, embedding size: ${registeredFace.faceEmbedding.size}")
                             try {
-                                val similarity = FaceNetModel.cosineSimilarity(
-                                    currentEmbedding, registeredFace.faceEmbedding
-                                )
+                                val similarity = FaceNetModel.cosineSimilarity(currentEmbedding, registeredFace.faceEmbedding)
                                 if (similarity > (bestMatch?.second ?: 0f)) {
                                     bestMatch = Pair(registeredFace.employeeName, similarity)
                                 }
-                            } catch (e: IllegalArgumentException) {
-                                Log.e("RecognitionScreen", "Cosine similarity failed for ${registeredFace.employeeName}: ${e.message}")
+                            } catch (e: Exception) {
+                                Log.e("RecognitionScreen", "Error calculating similarity", e)
                             }
                         }
 
                         if (bestMatch != null && bestMatch.second >= FACE_RECOGNITION_THRESHOLD) {
-                            Log.d("RecognitionScreen", "Match found: ${bestMatch.first} with similarity ${bestMatch.second}")
-                            onResult(bestMatch.first, firstFace.boundingBox.toComposeRect().toAndroidRectF())
+                            onResult(bestMatch.first, faceRect, bestMatch.second)
                         } else {
-                            Log.d("RecognitionScreen", "No match found, best similarity: ${bestMatch?.second}")
-                            onResult(null, firstFace.boundingBox.toComposeRect().toAndroidRectF())
+                            // Phát hiện khuôn mặt nhưng không khớp
+                            onResult(null, faceRect, bestMatch?.second)
                         }
                     } catch (e: Exception) {
-                        Log.e("RecognitionScreen", "Error processing embedding: ${e.message}")
-                        onResult(null, firstFace.boundingBox.toComposeRect().toAndroidRectF())
+                        Log.e("RecognitionScreen", "Error getting embedding", e)
+                        onResult(null, faceRect, null) // Lỗi, trả về hộp bao
                     }
                 } else {
-                    Log.e("RecognitionScreen", "Failed to crop face")
-                    onResult(null, firstFace.boundingBox.toComposeRect().toAndroidRectF())
+                    onResult(null, faceRect, null) // Không cắt được mặt, trả về hộp bao
                 }
             } else {
-                Log.d("RecognitionScreen", "No faces detected")
-                onResult(null, null)
+                onResult(null, null, null) // Không có khuôn mặt
             }
         }
         .addOnFailureListener { e ->
             Log.e("RecognitionScreen", "Face detection failed", e)
-            onResult(null, null)
+            onResult(null, null, null)
         }
         .addOnCompleteListener {
             imageProxy.close()
