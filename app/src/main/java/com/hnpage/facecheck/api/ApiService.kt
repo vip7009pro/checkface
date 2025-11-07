@@ -1,5 +1,4 @@
-
-package com.hnpage.facecheck
+package com.hnpage.facecheck.api
 
 import com.google.gson.JsonObject
 import retrofit2.Response
@@ -62,7 +61,7 @@ class ApiHandler(private val globalVar : GlobalVariable) {
 // Mock classes for GlobalVariable and ErpInterface to resolve references
 class GlobalVariable {
     fun getServer(): String {
-        return "http://14.160.33.94:3007/api"
+        return "http://14.160.33.94:5013/api"
     }
 }
 

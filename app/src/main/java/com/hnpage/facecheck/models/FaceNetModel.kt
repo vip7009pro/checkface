@@ -1,4 +1,4 @@
-package com.hnpage.facecheck
+package com.hnpage.facecheck.models
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -10,7 +10,6 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
-import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -87,5 +86,30 @@ class FaceNetModel(context: Context) {
             val dotProduct = emb1.zip(emb2).sumOf { (a, b) -> (a * b).toDouble() }
             return dotProduct.toFloat()
         }
+    }
+}
+
+// Dữ liệu khuôn mặt được lưu trữ
+data class FaceData(
+    val employeeName: String,
+    val faceEmbedding: FloatArray // Đặc trưng khuôn mặt (embedding)
+) {
+    // Cần thiết để so sánh các mảng FloatArray
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as FaceData
+
+        if (employeeName != other.employeeName) return false
+        if (!faceEmbedding.contentEquals(other.faceEmbedding)) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = employeeName.hashCode()
+        result = 31 * result + faceEmbedding.contentHashCode()
+        return result
     }
 }

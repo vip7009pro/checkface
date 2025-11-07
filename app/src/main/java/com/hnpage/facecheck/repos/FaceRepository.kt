@@ -1,9 +1,10 @@
-package com.hnpage.facecheck
+package com.hnpage.facecheck.repos
 
 import android.content.Context
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.hnpage.facecheck.models.FaceData
 
 class FaceRepository(context: Context) {
 

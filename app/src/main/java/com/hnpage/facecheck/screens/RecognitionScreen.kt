@@ -1,5 +1,6 @@
-package com.hnpage.facecheck
+package com.hnpage.facecheck.screens
 
+import android.Manifest
 import android.app.Activity
 import android.graphics.RectF
 import android.util.Log
@@ -16,22 +17,26 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cameraswitch // Đã thêm import này
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.toAndroidRectF
 import androidx.compose.ui.graphics.toComposeRect
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -40,6 +45,12 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.hnpage.facecheck.navigation.AppDestinations
+import com.hnpage.facecheck.models.FaceData
+import com.hnpage.facecheck.models.FaceNetModel
+import com.hnpage.facecheck.navigation.LocalNavController
+import com.hnpage.facecheck.repos.FaceRepository
+import com.hnpage.facecheck.viewmodels.AppViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -60,10 +71,11 @@ enum class AnalysisStatus {
 
 @kotlin.OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
 @Composable
-fun RecognitionScreen(navController: NavController) {
+fun RecognitionScreen(viewModel: AppViewModel = hiltViewModel()) {
+    val navController = LocalNavController.current
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
+    val cameraPermissionState = rememberPermissionState(Manifest.permission.CAMERA)
 
     val faceRepository = remember { FaceRepository(context) }
     val faceNetModel = remember { FaceNetModel(context) }
@@ -80,6 +92,11 @@ fun RecognitionScreen(navController: NavController) {
     var analysisStatus by remember { mutableStateOf(AnalysisStatus.IDLE) }
     var isFaceDetected by remember { mutableStateOf(false) }
 
+    // State để quản lý camera trước/sau
+    var isFrontCamera by remember { mutableStateOf(true) }
+    val currentCameraSelector = remember(isFrontCamera) {
+        if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+    }
 
     // Tải danh sách khuôn mặt đã đăng ký
     LaunchedEffect(key1 = lifecycleOwner) {
@@ -138,6 +155,16 @@ fun RecognitionScreen(navController: NavController) {
             TopAppBar(
                 title = { Text("Điểm danh Nhân viên") },
                 actions = {
+                    // Nút chuyển đổi camera
+                    IconButton(onClick = {
+                        isFrontCamera = !isFrontCamera
+                        Toast.makeText(context, if (isFrontCamera) "Chuyển sang cam trước" else "Chuyển sang cam sau", Toast.LENGTH_SHORT).show()
+                    }) {
+                        Icon(
+                            imageVector = Icons.Filled.Cameraswitch,
+                            contentDescription = "Chuyển đổi camera"
+                        )
+                    }
                     TextButton(onClick = {
                         faceRepository.clearFaces()
                         registeredFaces = emptyList()
@@ -178,10 +205,11 @@ fun RecognitionScreen(navController: NavController) {
                                                 ContextCompat.getMainExecutor(context).execute {
                                                     isFaceDetected = rect != null
                                                     faceBoundingBox = rect
+                                                    // Lưu kích thước ảnh đã xoay, xử lý lật nếu là cam trước
                                                     imageSize = Size(
                                                         imageProxy.height.toFloat(),
                                                         imageProxy.width.toFloat()
-                                                    ) // Lưu kích thước ảnh đã xoay
+                                                    )
 
                                                     if (name != null) {
                                                         recognizedEmployee = name
@@ -205,12 +233,11 @@ fun RecognitionScreen(navController: NavController) {
                                     }
                                 }
 
-                            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
+                            // Sử dụng cameraSelector đã được quản lý bởi state
                             try {
                                 cameraProvider.unbindAll()
                                 cameraProvider.bindToLifecycle(
-                                    lifecycleOwner, cameraSelector, preview, imageAnalysis
+                                    lifecycleOwner, currentCameraSelector, preview, imageAnalysis
                                 )
                             } catch (e: Exception) {
                                 Log.e("RecognitionScreen", "Use case binding failed", e)
@@ -224,7 +251,8 @@ fun RecognitionScreen(navController: NavController) {
                     DrawBoundingBox(
                         box = box,
                         imageSize = imageSize,
-                        isSuccess = analysisStatus == AnalysisStatus.SUCCESS
+                        isSuccess = analysisStatus == AnalysisStatus.SUCCESS,
+                        isFrontCamera = isFrontCamera // Truyền thông tin camera để xử lý lật ảnh
                     )
                 }
 
@@ -304,16 +332,20 @@ fun RecognitionScreen(navController: NavController) {
 }
 
 @Composable
-fun DrawBoundingBox(box: RectF, imageSize: Size, isSuccess: Boolean) {
+fun DrawBoundingBox(box: RectF, imageSize: Size, isSuccess: Boolean, isFrontCamera: Boolean) { // Thêm isFrontCamera
     Canvas(modifier = Modifier.fillMaxSize()) {
         if (imageSize.width > 0 && imageSize.height > 0) {
-            // Camera trước thường bị lật ngược theo chiều ngang
-            val mirroredBox = RectF(
-                imageSize.width - box.right,
-                box.top,
-                imageSize.width - box.left,
-                box.bottom
-            )
+            // Camera trước cần lật ngược theo chiều ngang, camera sau thì không
+            val transformedBox = if (isFrontCamera) {
+                RectF(
+                    imageSize.width - box.right,
+                    box.top,
+                    imageSize.width - box.left,
+                    box.bottom
+                )
+            } else {
+                box // Không lật nếu là camera sau
+            }
 
             // Tính toán tỉ lệ và offset để vẽ trên màn hình
             val scaleX = size.width / imageSize.width
@@ -324,11 +356,11 @@ fun DrawBoundingBox(box: RectF, imageSize: Size, isSuccess: Boolean) {
             val offsetX = (size.width - imageSize.width * scale) / 2
             val offsetY = (size.height - imageSize.height * scale) / 2
 
-            val drawRect = androidx.compose.ui.geometry.Rect(
-                left = mirroredBox.left * scale + offsetX,
-                top = mirroredBox.top * scale + offsetY,
-                right = mirroredBox.right * scale + offsetX,
-                bottom = mirroredBox.bottom * scale + offsetY
+            val drawRect = Rect(
+                left = transformedBox.left * scale + offsetX,
+                top = transformedBox.top * scale + offsetY,
+                right = transformedBox.right * scale + offsetX,
+                bottom = transformedBox.bottom * scale + offsetY
             )
 
             drawRect(
@@ -379,7 +411,8 @@ private fun processImageForRecognition(
 
                         for (registeredFace in registeredFaces) {
                             try {
-                                val similarity = FaceNetModel.cosineSimilarity(currentEmbedding, registeredFace.faceEmbedding)
+                                val similarity = FaceNetModel.Companion.cosineSimilarity(currentEmbedding, registeredFace.faceEmbedding)
+                                Log.d("RecognitionScreen", "Similarity with ${registeredFace.employeeName}: $similarity")
                                 if (similarity > (bestMatch?.second ?: 0f)) {
                                     bestMatch = Pair(registeredFace.employeeName, similarity)
                                 }
